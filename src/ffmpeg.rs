@@ -85,7 +85,7 @@ pub fn encode_sample(
 
     temporary::add(&dest, TempKind::Keepable);
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(crate::command::args::ffmpeg_path());
     cmd.kill_on_drop(true)
         .arg("-y")
         .args(input_args.iter().map(|a| &**a))
@@ -156,7 +156,7 @@ pub fn encode(
         write!(&mut metadata, " {} {preset}", vcodec.preset_arg()).unwrap();
     }
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(crate::command::args::ffmpeg_path());
     cmd.kill_on_drop(true)
         .args(input_args.iter().map(|a| &**a))
         .arg("-y")

@@ -19,6 +19,15 @@ use tokio::signal;
 
 #[derive(Parser)]
 #[command(version, about)]
+struct Cli {
+    #[clap(flatten)]
+    global: command::args::GlobalArgs,
+
+    #[clap(subcommand)]
+    command: Command,
+}
+
+#[derive(Parser)]
 enum Command {
     SampleEncode(command::sample_encode::Args),
     Vmaf(command::vmaf::Args),
@@ -42,7 +51,12 @@ async fn main() {
         .parse_default_env()
         .init();
 
-    let action = Command::parse();
+    let cli = Cli::parse();
+    
+    // Set the global ffmpeg path if provided
+    command::args::set_ffmpeg_path(cli.global.ffmpeg_path);
+    
+    let action = cli.command;
     let keep = action.keep_temp_files();
 
     let local = tokio::task::LocalSet::new();

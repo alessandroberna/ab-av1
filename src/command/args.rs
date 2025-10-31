@@ -9,9 +9,35 @@ use crate::{command::encode::default_output_ext, ffprobe::Ffprobe};
 use clap::{Parser, ValueHint};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
+
+/// Global ffmpeg path, can be set via command line argument
+static FFMPEG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Get the ffmpeg command to use (either custom path or default "ffmpeg")
+pub fn ffmpeg_path() -> &'static str {
+    FFMPEG_PATH
+        .get()
+        .and_then(|p| p.to_str())
+        .unwrap_or("ffmpeg")
+}
+
+/// Set the global ffmpeg path
+pub fn set_ffmpeg_path(path: Option<PathBuf>) {
+    if let Some(p) = path {
+        let _ = FFMPEG_PATH.set(p);
+    }
+}
+
+/// Global arguments that apply to all commands
+#[derive(Parser, Clone, Debug)]
+pub struct GlobalArgs {
+    /// Custom path to ffmpeg executable. If not set, uses 'ffmpeg' from PATH.
+    #[arg(long, global = true, value_hint = ValueHint::FilePath)]
+    pub ffmpeg_path: Option<PathBuf>,
+}
 
 /// Encoding args that apply when encoding to an output.
 #[derive(Parser, Clone)]

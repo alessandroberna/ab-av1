@@ -124,13 +124,21 @@ pub fn encode_precomputed_sample(
     dest.push(dest_file_name);
 
     // Mark as NotKeepable since these are large and should always be deleted
-    temporary::add(&dest, TempKind::NotKeepable);
+    temporary::add(&dest, TempKind::Keepable);
 
     let mut cmd = Command::new(crate::command::args::ffmpeg_path());
-    cmd.kill_on_drop(true)
-        .arg("-y")
-        .args(input_args.iter().map(|a| a.as_str()))
-        .arg2("-i", input)
+    cmd.kill_on_drop(true).arg("-y");
+    
+    // Process input args: split on '=' to separate option from value
+    for arg in input_args {
+        if let Some((opt, val)) = arg.split_once('=') {
+            cmd.arg(opt).arg(val);
+        } else {
+            cmd.arg(arg);
+        }
+    }
+    
+    cmd.arg2("-i", input)
         .arg2("-c:v", "ffv1")
         .arg2("-level", "3")
         .arg2("-coder", "1")

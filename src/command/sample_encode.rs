@@ -300,6 +300,8 @@ pub fn run(
                             
                             // Create precomputed reference sample if requested
                             let (precomp_ref, use_precomputed_ref) = if vmaf.precomp_sample {
+                                info!("encoding precomputed reference sample {sample_n}/{samples}");
+                                log::debug!("encoding precomputed sample with vfilter: {:?}, einput_args: {:?}", score.reference_vfilter.as_deref().or(args.vfilter.as_deref()), &vmaf.precomp_sample_einput_args);
                                 let (precomp_sample, mut precomp_output) = ffmpeg::encode_precomputed_sample(
                                     &sample,
                                     score.reference_vfilter.as_deref().or(args.vfilter.as_deref()),
@@ -307,24 +309,38 @@ pub fn run(
                                     temp_dir.clone(),
                                 )?;
                                 
-                                // Run precomputed sample encoding in background
-                                let precomp_handle = tokio::task::spawn(async move {
-                                    while let Some(enc_progress) = precomp_output.next().await {
-                                        // Just consume the output, we don't report progress for this
-                                        if let Err(e) = enc_progress {
-                                            log::warn!("precomputed sample encoding error: {e}");
+                                let mut logger = ProgressLogger::new("ab_av1::precomp", Instant::now());
+                                // Wait for precomputed sample encoding to complete and report progress
+                                while let Some(enc_progress) = precomp_output.next().await {
+                                    match enc_progress {
+                                        Ok(FfmpegOut::Progress { time, fps, .. }) => {
+                                            yield Update::Status(Status {
+                                                work: Work::PrecomputedEncode,
+                                                fps,
+                                                progress: (sample_idx as f32 + 0.25) / samples as f32,
+                                                full_pass,
+                                                sample: sample_n,
+                                                samples,
+                                            });
+                                            logger.update(sample_duration, time, fps);
                                         }
+                                        Err(e) => {
+                                            // Propagate errors instead of just logging
+                                            Err(e)?
+                                        }
+                                        _ => {}
                                     }
-                                    precomp_output.wait().await
-                                });
+                                }
+                                precomp_output.wait().await?;
                                 
-                                (Some((precomp_sample, precomp_handle)), true)
+                                info!("precomputed reference sample ready");
+                                (Some(precomp_sample), true)
                             } else {
                                 (None, false)
                             };
                             
                             let vmaf = vmaf::run(
-                                &precomp_ref.as_ref().map(|(p, _)| p).unwrap_or(&sample),
+                                &precomp_ref.as_ref().unwrap_or(&sample),
                                 &encoded_sample,
                                 &vmaf.ffmpeg_lavfi(
                                     encoded_probe.resolution,
@@ -364,11 +380,7 @@ pub fn run(
                             }
 
                             // Clean up precomputed reference sample if used
-                            if let Some((precomp_path, precomp_handle)) = precomp_ref {
-                                // Wait for precomputed encoding to finish (if not already)
-                                if let Err(e) = precomp_handle.await {
-                                    log::warn!("precomputed sample task error: {e}");
-                                }
+                            if let Some(precomp_path) = precomp_ref {
                                 // Delete the precomputed sample (it's marked as NotKeepable, 
                                 // but we delete it explicitly here for immediate cleanup)
                                 _ = fs::remove_file(&precomp_path).await;
@@ -794,6 +806,7 @@ pub struct Output {
 pub enum Work {
     #[default]
     Encode,
+    PrecomputedEncode,
     Score(ScoreKind),
 }
 
@@ -802,6 +815,7 @@ impl Work {
     pub fn fps_label(&self) -> &'static str {
         match self {
             Self::Encode => "enc",
+            Self::PrecomputedEncode => "precomp",
             Self::Score(kind) => kind.fps_label(),
         }
     }

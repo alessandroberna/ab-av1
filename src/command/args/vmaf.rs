@@ -62,8 +62,16 @@ pub struct Vmaf {
     /// This flag behaves similarly to --enc-input and is only used when --precomp-sample is enabled.
     ///
     /// See --enc-input docs for more details on format.
-    #[arg(long = "precomp-sample-einput", allow_hyphen_values = true)]
+    #[arg(long = "precomp-sample-einput", allow_hyphen_values = true, value_parser = parse_precomp_einput_arg)]
     pub precomp_sample_einput_args: Vec<String>,
+}
+
+fn parse_precomp_einput_arg(arg: &str) -> anyhow::Result<String> {
+    let mut arg = arg.to_owned();
+    if !arg.starts_with('-') {
+        arg.insert(0, '-');
+    }
+    Ok(arg)
 }
 
 impl Default for Vmaf {

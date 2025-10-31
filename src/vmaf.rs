@@ -13,18 +13,35 @@ pub fn run(
     distorted: &Path,
     filter_complex: &str,
     fps: Option<f32>,
+    use_cuda: bool,
 ) -> anyhow::Result<impl Stream<Item = VmafOut> + use<>> {
     info!(
-        "vmaf {} vs reference {}",
+        "vmaf{} {} vs reference {}",
+        if use_cuda { " (CUDA)" } else { "" },
         distorted.file_name().and_then(|n| n.to_str()).unwrap_or(""),
         reference.file_name().and_then(|n| n.to_str()).unwrap_or(""),
     );
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.kill_on_drop(true)
-        .arg2_opt("-r", fps)
-        .arg2("-i", distorted)
-        .arg2_opt("-r", fps)
+    let mut cmd = Command::new(crate::command::args::ffmpeg_path());
+    cmd.kill_on_drop(true);
+
+    // For CUDA, add hardware acceleration args
+    if use_cuda {
+        cmd.arg2("-hwaccel", "cuda")
+            .arg2("-hwaccel_output_format", "cuda");
+            //.arg2("-codec:v", "av1_cuvid");
+    }
+
+    cmd.arg2_opt("-r", fps)
+        .arg2("-i", distorted);
+
+    if use_cuda {
+        cmd.arg2("-hwaccel", "cuda")
+            .arg2("-hwaccel_output_format", "cuda");
+            //.arg2("-codec:v", "av1_cuvid");
+    }
+
+    cmd.arg2_opt("-r", fps)
         .arg2("-i", reference)
         .arg2("-filter_complex", filter_complex)
         // Workaround unused streams causing ffmpeg memory leaks

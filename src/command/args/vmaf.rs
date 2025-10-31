@@ -40,6 +40,12 @@ pub struct Vmaf {
     /// Setting to 0 disables use.
     #[arg(long, default_value_t = DEFAULT_VMAF_FPS)]
     pub vmaf_fps: f32,
+
+    /// Use CUDA-accelerated VMAF (libvmaf_cuda) instead of standard libvmaf.
+    /// Requires CUDA-capable GPU and ffmpeg built with CUDA support.
+    /// When enabled, videos will be decoded and processed on GPU.
+    #[arg(long)]
+    pub vmaf_cuda: bool,
 }
 
 impl Default for Vmaf {
@@ -48,6 +54,7 @@ impl Default for Vmaf {
             vmaf_args: <_>::default(),
             vmaf_scale: <_>::default(),
             vmaf_fps: DEFAULT_VMAF_FPS,
+            vmaf_cuda: false,
         }
     }
 }
@@ -57,6 +64,7 @@ impl std::hash::Hash for Vmaf {
         self.vmaf_args.hash(state);
         self.vmaf_scale.hash(state);
         self.vmaf_fps.to_ne_bytes().hash(state);
+        self.vmaf_cuda.hash(state);
     }
 }
 
@@ -76,6 +84,10 @@ impl Vmaf {
         pix_fmt: Option<PixelFormat>,
         ref_vfilter: Option<&str>,
     ) -> String {
+        if self.vmaf_cuda {
+            return self.ffmpeg_lavfi_cuda(distorted_res, ref_vfilter);
+        }
+
         let mut args = self.vmaf_args.clone();
         if !args.iter().any(|a| a.contains("n_threads")) {
             // default n_threads to all cores
@@ -119,6 +131,61 @@ impl Vmaf {
         let prefix = format!(
             "[0:v]{format}{scale}setpts=PTS-STARTPTS,settb=AVTB[dis];\
              [1:v]{format}{ref_vf}{scale}setpts=PTS-STARTPTS,settb=AVTB[ref];\
+             [dis][ref]"
+        );
+
+        lavfi.insert_str(0, &prefix);
+        lavfi
+    }
+
+    /// Returns ffmpeg `filter_complex` value for calculating vmaf with CUDA acceleration.
+    /// Heavily duplicated from the above, will refactor later.
+    fn ffmpeg_lavfi_cuda(
+        &self,
+        distorted_res: Option<(u32, u32)>,
+        ref_vfilter: Option<&str>,
+    ) -> String {
+        let args = self.vmaf_args.clone();
+        let mut lavfi = if args.is_empty() {
+            "libvmaf_cuda=ts_sync_mode=nearest:shortest=true".to_string()
+        } else {
+            format!("libvmaf_cuda={}", args.join(":"))
+        };
+
+        let mut model = VmafModel::from_args(&args);
+        if let (None, Some((w, h))) = (model, distorted_res)
+            && w > 2560
+            && h > 1440
+        {
+            // for >2k resolutions use 4k model
+            lavfi.push_str(":model=version=vmaf_4k_v0.6.1");
+            model = Some(VmafModel::Vmaf4K);
+        }
+
+        let ref_vf: Cow<_> = match ref_vfilter {
+            None => "".into(),
+            Some(vf) if vf.ends_with(',') => vf.into(),
+            Some(vf) => format!("{vf},").into(),
+        };
+
+        // For CUDA, we use scale_cuda instead of scale
+        let scale = dbg!(self
+            .vf_scale(model.unwrap_or_default(), distorted_res)
+            .map(|(w, h)| {
+                // scale_cuda needs explicit format specification
+                format!("scale_npp={}:{}:format=yuv420p:interp_algo=lanczos", w, h)
+            })
+            .unwrap_or_else(|| "scale_npp=format=yuv420p:interp_algo=lanczos".to_string()));
+            // 
+
+        // CUDA pipeline:
+        // * Decode on GPU (handled by input args in vmaf.rs)
+        // * Apply reference vfilter if any
+        // * Scale to yuv420p on GPU
+        // * Process with libvmaf_cuda
+        let prefix = format!(
+            "[0:v]{scale}[dis];\
+             [1:v]{ref_vf}{scale}[ref];\
              [dis][ref]"
         );
 
@@ -382,5 +449,50 @@ fn vmaf_lavfi_1080p() {
         "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4"
+    );
+}
+
+#[test]
+fn vmaf_lavfi_cuda_1080p() {
+    let vmaf = Vmaf {
+        vmaf_args: vec!["log_fmt=json:log_path=output.json".into()],
+        vmaf_cuda: true,
+        ..<_>::default()
+    };
+    assert_eq!(
+        vmaf.ffmpeg_lavfi(Some((1920, 1080)), None, None),
+        "[0:v]scale_cuda=format=yuv420p,[dis];\
+         [1:v]scale_cuda=format=yuv420p,[ref];\
+         [dis][ref]libvmaf_cuda=log_fmt=json:log_path=output.json"
+    );
+}
+
+#[test]
+fn vmaf_lavfi_cuda_720p_upscale() {
+    let vmaf = Vmaf {
+        vmaf_args: vec![],
+        vmaf_cuda: true,
+        ..<_>::default()
+    };
+    assert_eq!(
+        vmaf.ffmpeg_lavfi(Some((1280, 720)), None, None),
+        "[0:v]scale_cuda=1920:-1:format=yuv420p,[dis];\
+         [1:v]scale_cuda=1920:-1:format=yuv420p,[ref];\
+         [dis][ref]libvmaf_cuda"
+    );
+}
+
+#[test]
+fn vmaf_lavfi_cuda_4k() {
+    let vmaf = Vmaf {
+        vmaf_args: vec![],
+        vmaf_cuda: true,
+        ..<_>::default()
+    };
+    assert_eq!(
+        vmaf.ffmpeg_lavfi(Some((3840, 2160)), None, None),
+        "[0:v]scale_cuda=format=yuv420p,[dis];\
+         [1:v]scale_cuda=format=yuv420p,[ref];\
+         [dis][ref]libvmaf_cuda:model=version=vmaf_4k_v0.6.1"
     );
 }

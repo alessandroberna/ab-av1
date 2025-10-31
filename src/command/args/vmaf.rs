@@ -204,13 +204,13 @@ impl Vmaf {
         }
 
         // For CUDA, we use scale_cuda instead of scale
-        let scale = dbg!(self
+        let scale = self
             .vf_scale(model.unwrap_or_default(), distorted_res)
             .map(|(w, h)| {
                 // scale_cuda needs explicit format specification
                 format!("scale_npp={}:{}:format=yuv420p:interp_algo=lanczos", w, h)
             })
-            .unwrap_or_else(|| "scale_npp=format=yuv420p:interp_algo=lanczos".to_string()));
+            .unwrap_or_else(|| "scale_npp=format=yuv420p:interp_algo=lanczos".to_string());
             // 
 
         let prefix = if use_precomputed_ref {
@@ -562,7 +562,7 @@ fn vmaf_lavfi_cuda_precomputed_ref() {
     assert_eq!(
         vmaf.ffmpeg_lavfi(Some((1920, 1080)), None, None, true),
         "[0:v]scale_npp=format=yuv420p:interp_algo=lanczos[dis];\
-         [1:v]hwupload_cuda,scale_npp=format=yuv420p:interp_algo=lanczos[ref];\
+         [1:v]scale_npp=format=yuv420p:interp_algo=lanczos[ref];\
          [dis][ref]libvmaf_cuda=ts_sync_mode=nearest:shortest=true"
     );
 }

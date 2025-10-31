@@ -14,6 +14,7 @@ pub fn run(
     filter_complex: &str,
     fps: Option<f32>,
     use_cuda: bool,
+    use_precomputed_ref: bool,
 ) -> anyhow::Result<impl Stream<Item = VmafOut> + use<>> {
     info!(
         "vmaf{} {} vs reference {}",
@@ -25,7 +26,7 @@ pub fn run(
     let mut cmd = Command::new(crate::command::args::ffmpeg_path());
     cmd.kill_on_drop(true);
 
-    // For CUDA, add hardware acceleration args
+    // For CUDA, add hardware acceleration args for distorted stream
     if use_cuda {
         cmd.arg2("-hwaccel", "cuda")
             .arg2("-hwaccel_output_format", "cuda");
@@ -35,7 +36,9 @@ pub fn run(
     cmd.arg2_opt("-r", fps)
         .arg2("-i", distorted);
 
-    if use_cuda {
+    // For reference stream: only add hwaccel if NOT using precomputed reference
+    // Precomputed FFV1 files should be decoded normally (no hwaccel)
+    if use_cuda && !use_precomputed_ref {
         cmd.arg2("-hwaccel", "cuda")
             .arg2("-hwaccel_output_format", "cuda");
             //.arg2("-codec:v", "av1_cuvid");

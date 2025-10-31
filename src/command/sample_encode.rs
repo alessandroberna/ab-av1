@@ -350,6 +350,7 @@ pub fn run(
                                 ),
                                 vmaf.fps(),
                                 vmaf.vmaf_cuda,
+                                use_precomputed_ref,
                             )?;
                             let mut vmaf = pin!(vmaf);
                             let mut logger = ProgressLogger::new("ab_av1::vmaf", Instant::now());

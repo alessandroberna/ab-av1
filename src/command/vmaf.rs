@@ -78,6 +78,7 @@ pub async fn vmaf(
         ),
         vmaf.fps(),
         vmaf.vmaf_cuda,
+        false, // not using precomputed ref
     )?);
     let mut logger = ProgressLogger::new(module_path!(), Instant::now());
     let mut vmaf_score = None;

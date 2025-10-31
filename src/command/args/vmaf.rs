@@ -214,12 +214,14 @@ impl Vmaf {
             // 
 
         let prefix = if use_precomputed_ref {
-            // When using precomputed ref, filters already applied to reference
-            // but we still need scale_npp for format conversion to yuv420p
-            let ref_scale = "scale_npp=format=yuv420p:interp_algo=lanczos";
+            // When using precomputed ref with CUDA:
+            // - Precomputed FFV1 is decoded on CPU
+            // - Need to upload to GPU with hwupload_cuda
+            // - Then convert format with scale_npp
+            let ref_upload = "hwupload_cuda,scale_npp=format=yuv420p:interp_algo=lanczos";
             format!(
                 "[0:v]{scale}[dis];\
-                 [1:v]{ref_scale}[ref];\
+                 [1:v]{ref_upload}[ref];\
                  [dis][ref]"
             )
         } else {
@@ -560,7 +562,7 @@ fn vmaf_lavfi_cuda_precomputed_ref() {
     assert_eq!(
         vmaf.ffmpeg_lavfi(Some((1920, 1080)), None, None, true),
         "[0:v]scale_npp=format=yuv420p:interp_algo=lanczos[dis];\
-         [1:v]scale_npp=format=yuv420p:interp_algo=lanczos[ref];\
+         [1:v]hwupload_cuda,scale_npp=format=yuv420p:interp_algo=lanczos[ref];\
          [dis][ref]libvmaf_cuda=ts_sync_mode=nearest:shortest=true"
     );
 }

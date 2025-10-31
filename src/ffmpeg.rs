@@ -83,7 +83,7 @@ pub fn encode_sample(
     let mut dest = temporary::process_dir(temp_dir);
     dest.push(dest_file_name);
 
-    temporary::add(&dest, TempKind::Keepable);
+    temporary::add(&dest, TempKind::NotKeepable);
 
     let mut cmd = Command::new(crate::command::args::ffmpeg_path());
     cmd.kill_on_drop(true)

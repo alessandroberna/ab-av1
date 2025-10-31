@@ -110,6 +110,48 @@ pub fn encode_sample(
     Ok((dest, stream))
 }
 
+/// Encode a precomputed reference sample with FFV1 lossless codec.
+/// This is used for VMAF calculations to precompute filtered reference once.
+pub fn encode_precomputed_sample(
+    input: &Path,
+    vfilter: Option<&str>,
+    input_args: &[String],
+    temp_dir: Option<PathBuf>,
+) -> anyhow::Result<(PathBuf, FfmpegOutStream)> {
+    let dest_file_name = input.with_extension("precomp.ffv1.mkv");
+    let dest_file_name = dest_file_name.file_name().unwrap();
+    let mut dest = temporary::process_dir(temp_dir);
+    dest.push(dest_file_name);
+
+    // Mark as NotKeepable since these are large and should always be deleted
+    temporary::add(&dest, TempKind::NotKeepable);
+
+    let mut cmd = Command::new(crate::command::args::ffmpeg_path());
+    cmd.kill_on_drop(true)
+        .arg("-y")
+        .args(input_args.iter().map(|a| a.as_str()))
+        .arg2("-i", input)
+        .arg2("-c:v", "ffv1")
+        .arg2("-level", "3")
+        .arg2("-coder", "1")
+        .arg2("-context", "1")
+        .arg2("-slicecrc", "0")
+        .arg2_opt("-vf", vfilter)
+        .arg("-an")
+        .arg(&dest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let cmd_str = cmd.to_cmd_str();
+    debug!("cmd `{cmd_str}`");
+
+    let enc = cmd.spawn().context("ffmpeg encode_precomputed_sample")?;
+
+    let stream = FfmpegOut::stream(enc, "ffmpeg encode_precomputed_sample", cmd_str);
+    Ok((dest, stream))
+}
+
+
 /// Encode to output.
 pub fn encode(
     FfmpegEncodeArgs {

@@ -46,6 +46,24 @@ pub struct Vmaf {
     /// When enabled, videos will be decoded and processed on GPU.
     #[arg(long)]
     pub vmaf_cuda: bool,
+
+    /// Precompute the reference filtered sample for VMAF calculation.
+    /// The reference sample will be encoded with FFV1 lossless codec with filters applied,
+    /// then used for VMAF analysis. This can improve VMAF performance when using complex
+    /// filters, as the filtered reference is computed once and reused.
+    /// The precomputed sample is deleted after VMAF computation.
+    #[arg(long)]
+    pub precomp_sample: bool,
+
+    /// Additional ffmpeg input encoder arg(s) for precomputed sample encoding.
+    /// E.g. `--precomp-sample-einput hwaccel=vaapi --precomp-sample-einput hwaccel_output_format=vaapi`.
+    /// These are added as ffmpeg input file options for the precomputed sample encoding.
+    ///
+    /// This flag behaves similarly to --enc-input and is only used when --precomp-sample is enabled.
+    ///
+    /// See --enc-input docs for more details on format.
+    #[arg(long = "precomp-sample-einput", allow_hyphen_values = true)]
+    pub precomp_sample_einput_args: Vec<String>,
 }
 
 impl Default for Vmaf {
@@ -55,6 +73,8 @@ impl Default for Vmaf {
             vmaf_scale: <_>::default(),
             vmaf_fps: DEFAULT_VMAF_FPS,
             vmaf_cuda: false,
+            precomp_sample: false,
+            precomp_sample_einput_args: <_>::default(),
         }
     }
 }
@@ -65,6 +85,8 @@ impl std::hash::Hash for Vmaf {
         self.vmaf_scale.hash(state);
         self.vmaf_fps.to_ne_bytes().hash(state);
         self.vmaf_cuda.hash(state);
+        self.precomp_sample.hash(state);
+        self.precomp_sample_einput_args.hash(state);
     }
 }
 
@@ -78,14 +100,17 @@ impl Vmaf {
     }
 
     /// Returns ffmpeg `filter_complex`/`lavfi` value for calculating vmaf.
+    /// If `use_precomputed_ref` is true, the reference stream is assumed to already have
+    /// filters applied (via precomputed FFV1 sample) and won't have vfilter/scaling applied.
     pub fn ffmpeg_lavfi(
         &self,
         distorted_res: Option<(u32, u32)>,
         pix_fmt: Option<PixelFormat>,
         ref_vfilter: Option<&str>,
+        use_precomputed_ref: bool,
     ) -> String {
         if self.vmaf_cuda {
-            return self.ffmpeg_lavfi_cuda(distorted_res, ref_vfilter);
+            return self.ffmpeg_lavfi_cuda(distorted_res, ref_vfilter, use_precomputed_ref);
         }
 
         let mut args = self.vmaf_args.clone();
@@ -112,27 +137,34 @@ impl Vmaf {
             model = Some(VmafModel::Vmaf4K);
         }
 
-        let ref_vf: Cow<_> = match ref_vfilter {
-            None => "".into(),
-            Some(vf) if vf.ends_with(',') => vf.into(),
-            Some(vf) => format!("{vf},").into(),
-        };
         let format = pix_fmt.map(|v| format!("format={v},")).unwrap_or_default();
         let scale = self
             .vf_scale(model.unwrap_or_default(), distorted_res)
             .map(|(w, h)| format!("scale={w}:{h}:flags=bicubic,"))
             .unwrap_or_default();
 
-        // prefix:
-        // * Add reference-vfilter if any
-        // * convert both streams to common pixel format
-        // * scale to vmaf width if necessary
-        // * sync presentation timestamp
-        let prefix = format!(
-            "[0:v]{format}{scale}setpts=PTS-STARTPTS,settb=AVTB[dis];\
-             [1:v]{format}{ref_vf}{scale}setpts=PTS-STARTPTS,settb=AVTB[ref];\
-             [dis][ref]"
-        );
+        let prefix = if use_precomputed_ref {
+            // When using precomputed ref, filters already applied to reference
+            // Only process distorted stream
+            format!(
+                "[0:v]{format}{scale}setpts=PTS-STARTPTS,settb=AVTB[dis];\
+                 [1:v]setpts=PTS-STARTPTS,settb=AVTB[ref];\
+                 [dis][ref]"
+            )
+        } else {
+            // Normal mode: apply vfilter and scaling to both streams
+            let ref_vf: Cow<_> = match ref_vfilter {
+                None => "".into(),
+                Some(vf) if vf.ends_with(',') => vf.into(),
+                Some(vf) => format!("{vf},").into(),
+            };
+            
+            format!(
+                "[0:v]{format}{scale}setpts=PTS-STARTPTS,settb=AVTB[dis];\
+                 [1:v]{format}{ref_vf}{scale}setpts=PTS-STARTPTS,settb=AVTB[ref];\
+                 [dis][ref]"
+            )
+        };
 
         lavfi.insert_str(0, &prefix);
         lavfi
@@ -144,6 +176,7 @@ impl Vmaf {
         &self,
         distorted_res: Option<(u32, u32)>,
         ref_vfilter: Option<&str>,
+        use_precomputed_ref: bool,
     ) -> String {
         let args = self.vmaf_args.clone();
         let mut lavfi = if args.is_empty() {
@@ -162,12 +195,6 @@ impl Vmaf {
             model = Some(VmafModel::Vmaf4K);
         }
 
-        let ref_vf: Cow<_> = match ref_vfilter {
-            None => "".into(),
-            Some(vf) if vf.ends_with(',') => vf.into(),
-            Some(vf) => format!("{vf},").into(),
-        };
-
         // For CUDA, we use scale_cuda instead of scale
         let scale = dbg!(self
             .vf_scale(model.unwrap_or_default(), distorted_res)
@@ -178,16 +205,33 @@ impl Vmaf {
             .unwrap_or_else(|| "scale_npp=format=yuv420p:interp_algo=lanczos".to_string()));
             // 
 
-        // CUDA pipeline:
-        // * Decode on GPU (handled by input args in vmaf.rs)
-        // * Apply reference vfilter if any
-        // * Scale to yuv420p on GPU
-        // * Process with libvmaf_cuda
-        let prefix = format!(
-            "[0:v]{scale}[dis];\
-             [1:v]{ref_vf}{scale}[ref];\
-             [dis][ref]"
-        );
+        let prefix = if use_precomputed_ref {
+            // When using precomputed ref, filters already applied to reference
+            // but we still need scale_npp for format conversion to yuv420p
+            let ref_scale = "scale_npp=format=yuv420p:interp_algo=lanczos";
+            format!(
+                "[0:v]{scale}[dis];\
+                 [1:v]{ref_scale}[ref];\
+                 [dis][ref]"
+            )
+        } else {
+            // CUDA pipeline:
+            // * Decode on GPU (handled by input args in vmaf.rs)
+            // * Apply reference vfilter if any
+            // * Scale to yuv420p on GPU
+            // * Process with libvmaf_cuda
+            let ref_vf: Cow<_> = match ref_vfilter {
+                None => "".into(),
+                Some(vf) if vf.ends_with(',') => vf.into(),
+                Some(vf) => format!("{vf},").into(),
+            };
+            
+            format!(
+                "[0:v]{scale}[dis];\
+                 [1:v]{ref_vf}{scale}[ref];\
+                 [dis][ref]"
+            )
+        };
 
         lavfi.insert_str(0, &prefix);
         lavfi
@@ -298,7 +342,8 @@ fn vmaf_lavfi() {
         vmaf.ffmpeg_lavfi(
             None,
             Some(PixelFormat::Yuv420p),
-            Some("scale=1280:-1,fps=24")
+            Some("scale=1280:-1,fps=24"),
+            false
         ),
         "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,scale=1280:-1,fps=24,setpts=PTS-STARTPTS,settb=AVTB[ref];\
@@ -315,7 +360,7 @@ fn vmaf_lavfi_default() {
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads={}",
         thread::available_parallelism().map_or(1, |p| p.get())
     );
-    assert_eq!(vmaf.ffmpeg_lavfi(None, None, None), expected);
+    assert_eq!(vmaf.ffmpeg_lavfi(None, None, None, false), expected);
 }
 
 #[test]
@@ -328,7 +373,7 @@ fn vmaf_lavfi_default_pix_fmt() {
         thread::available_parallelism().map_or(1, |p| p.get())
     );
     assert_eq!(
-        vmaf.ffmpeg_lavfi(None, Some(PixelFormat::Yuv420p10le), None),
+        vmaf.ffmpeg_lavfi(None, Some(PixelFormat::Yuv420p10le), None, false),
         expected
     );
 }
@@ -346,7 +391,7 @@ fn vmaf_lavfi_include_n_threads() {
         thread::available_parallelism().map_or(1, |p| p.get())
     );
     assert_eq!(
-        vmaf.ffmpeg_lavfi(None, Some(PixelFormat::Yuv420p), None),
+        vmaf.ffmpeg_lavfi(None, Some(PixelFormat::Yuv420p), None, false),
         expected
     );
 }
@@ -359,7 +404,7 @@ fn vmaf_lavfi_small_width() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None),
+        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None, false),
         "[0:v]format=yuv420p,scale=1920:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,scale=1920:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[ref];\
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4"
@@ -374,7 +419,7 @@ fn vmaf_lavfi_4k() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((3840, 2160)), Some(PixelFormat::Yuv420p), None),
+        vmaf.ffmpeg_lavfi(Some((3840, 2160)), Some(PixelFormat::Yuv420p), None, false),
         "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4:model=version=vmaf_4k_v0.6.1"
@@ -389,7 +434,7 @@ fn vmaf_lavfi_3k_upscale_to_4k() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((3008, 1692)), Some(PixelFormat::Yuv420p), None),
+        vmaf.ffmpeg_lavfi(Some((3008, 1692)), Some(PixelFormat::Yuv420p), None, false),
         "[0:v]format=yuv420p,scale=3840:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,scale=3840:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[ref];\
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:model=version=vmaf_4k_v0.6.1"
@@ -408,7 +453,7 @@ fn vmaf_lavfi_small_width_custom_model() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None),
+        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None, false),
         "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:model=version=foo:n_threads=5:n_subsample=4"
@@ -431,7 +476,7 @@ fn vmaf_lavfi_custom_model_and_width() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None),
+        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None, false),
         "[0:v]format=yuv420p,scale=123:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,scale=123:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[ref];\
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:model=version=foo:n_threads=5:n_subsample=4"
@@ -445,7 +490,7 @@ fn vmaf_lavfi_1080p() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1920, 1080)), Some(PixelFormat::Yuv420p), None),
+        vmaf.ffmpeg_lavfi(Some((1920, 1080)), Some(PixelFormat::Yuv420p), None, false),
         "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
          [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
          [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4"
@@ -460,9 +505,9 @@ fn vmaf_lavfi_cuda_1080p() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1920, 1080)), None, None),
-        "[0:v]scale_cuda=format=yuv420p,[dis];\
-         [1:v]scale_cuda=format=yuv420p,[ref];\
+        vmaf.ffmpeg_lavfi(Some((1920, 1080)), None, None, false),
+        "[0:v]scale_npp=format=yuv420p:interp_algo=lanczos[dis];\
+         [1:v]scale_npp=format=yuv420p:interp_algo=lanczos[ref];\
          [dis][ref]libvmaf_cuda=log_fmt=json:log_path=output.json"
     );
 }
@@ -475,10 +520,10 @@ fn vmaf_lavfi_cuda_720p_upscale() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1280, 720)), None, None),
-        "[0:v]scale_cuda=1920:-1:format=yuv420p,[dis];\
-         [1:v]scale_cuda=1920:-1:format=yuv420p,[ref];\
-         [dis][ref]libvmaf_cuda"
+        vmaf.ffmpeg_lavfi(Some((1280, 720)), None, None, false),
+        "[0:v]scale_npp=1920:-1:format=yuv420p:interp_algo=lanczos[dis];\
+         [1:v]scale_npp=1920:-1:format=yuv420p:interp_algo=lanczos[ref];\
+         [dis][ref]libvmaf_cuda=ts_sync_mode=nearest:shortest=true"
     );
 }
 
@@ -490,9 +535,39 @@ fn vmaf_lavfi_cuda_4k() {
         ..<_>::default()
     };
     assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((3840, 2160)), None, None),
-        "[0:v]scale_cuda=format=yuv420p,[dis];\
-         [1:v]scale_cuda=format=yuv420p,[ref];\
-         [dis][ref]libvmaf_cuda:model=version=vmaf_4k_v0.6.1"
+        vmaf.ffmpeg_lavfi(Some((3840, 2160)), None, None, false),
+        "[0:v]scale_npp=format=yuv420p:interp_algo=lanczos[dis];\
+         [1:v]scale_npp=format=yuv420p:interp_algo=lanczos[ref];\
+         [dis][ref]libvmaf_cuda=ts_sync_mode=nearest:shortest=true:model=version=vmaf_4k_v0.6.1"
     );
 }
+
+#[test]
+fn vmaf_lavfi_cuda_precomputed_ref() {
+    let vmaf = Vmaf {
+        vmaf_args: vec![],
+        vmaf_cuda: true,
+        ..<_>::default()
+    };
+    assert_eq!(
+        vmaf.ffmpeg_lavfi(Some((1920, 1080)), None, None, true),
+        "[0:v]scale_npp=format=yuv420p:interp_algo=lanczos[dis];\
+         [1:v]scale_npp=format=yuv420p:interp_algo=lanczos[ref];\
+         [dis][ref]libvmaf_cuda=ts_sync_mode=nearest:shortest=true"
+    );
+}
+
+#[test]
+fn vmaf_lavfi_precomputed_ref() {
+    let vmaf = Vmaf {
+        vmaf_args: vec!["n_threads=5".into()],
+        ..<_>::default()
+    };
+    assert_eq!(
+        vmaf.ffmpeg_lavfi(Some((1920, 1080)), Some(PixelFormat::Yuv420p), None, true),
+        "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
+         [1:v]setpts=PTS-STARTPTS,settb=AVTB[ref];\
+         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5"
+    );
+}
+

@@ -74,6 +74,7 @@ pub async fn vmaf(
             dprobe.resolution,
             PixelFormat::opt_max(dprobe.pixel_format(), rprobe.pixel_format()),
             score.reference_vfilter.as_deref(),
+            false, // not using precomputed ref
         ),
         vmaf.fps(),
         vmaf.vmaf_cuda,

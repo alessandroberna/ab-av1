@@ -218,7 +218,12 @@ impl Vmaf {
             // - Precomputed FFV1 is decoded on CPU
             // - Need to upload to GPU with hwupload_cuda
             // - Then convert format with scale_npp
-            let ref_upload = "hwupload_cuda,scale_npp=format=yuv420p:interp_algo=lanczos";
+            let ref_upload = self
+                .vf_scale(model.unwrap_or_default(), distorted_res)
+                .map(|(w, h)| {
+                    format!("hwupload_cuda,scale_npp={}:{}:format=yuv420p:interp_algo=lanczos", w, h)
+                })
+                .unwrap_or_else(|| "hwupload_cuda,scale_npp=format=yuv420p:interp_algo=lanczos".to_string());
             format!(
                 "[0:v]{scale}[dis];\
                  [1:v]{ref_upload}[ref];\
